@@ -5794,11 +5794,6 @@ var Pattern = (function patternPattern() {
     }
   };
 
-  constructor.shadingFromIR = function pattern_shadingFromIR(ctx, raw) {
-    var obj = window[raw[0]];
-    return obj.fromIR(ctx, raw);
-  }
-
   constructor.parseShading = function pattern_shading(shading, matrix,
       xref, res, ctx) {
 
@@ -5888,37 +5883,6 @@ var RadialAxialShading = (function radialAxialShading() {
     }
 
     this.colorStops = colorStops;
-  }
-
-  constructor.fromIR = function(ctx, raw) {
-    var type = raw[1];
-    var colorStops = raw[2];
-    var p0 = raw[3];
-    var p1 = raw[4];
-    var r0 = raw[5];
-    var r1 = raw[6];
-
-    var curMatrix = ctx.mozCurrentTransform;
-    if (curMatrix) {
-      var userMatrix = ctx.mozCurrentTransformInverse;
-
-      p0 = Util.applyTransform(p0, curMatrix);
-      p0 = Util.applyTransform(p0, userMatrix);
-
-      p1 = Util.applyTransform(p1, curMatrix);
-      p1 = Util.applyTransform(p1, userMatrix);
-    }
-
-    if (type == 2)
-      var grad = ctx.createLinearGradient(p0[0], p0[1], p1[0], p1[1]);
-    else if (type == 3)
-      var grad = ctx.createRadialGradient(p0[0], p0[1], r0, p1[0], p1[1], r1);
-
-    for (var i = 0, ii = colorStops.length; i < ii; ++i) {
-      var c = colorStops[i];
-      grad.addColorStop(c[0], c[1]);
-    }
-    return grad;
   }
 
   constructor.prototype = {

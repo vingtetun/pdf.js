@@ -514,7 +514,7 @@ var CanvasGraphics = (function canvasGraphics() {
         // Build the pattern based on the IR data.
         var pattern = new TilingPatternIR(IR, color, this.ctx, this.objs);
       } else if (IR[0] == 'RadialAxialShading' || IR[0] == 'DummyShading') {
-        var pattern = Pattern.shadingFromIR(this.ctx, IR);
+        var pattern = RadialAxialShadingIR(IR, this.ctx);
       } else {
         throw 'Unkown IR type';
       }
@@ -574,7 +574,7 @@ var CanvasGraphics = (function canvasGraphics() {
       var ctx = this.ctx;
 
       this.save();
-      ctx.fillStyle = Pattern.shadingFromIR(ctx, patternIR);
+      ctx.fillStyle = RadialAxialShadingIR(patternIR, ctx);
 
       var inv = ctx.mozCurrentTransformInverse;
       if (inv) {
@@ -918,3 +918,35 @@ var JpegStreamIR = (function() {
 
   return JpegStreamIR;
 })();
+
+
+function RadialAxialShadingIR(raw, ctx) {
+  var type = raw[1];
+  var colorStops = raw[2];
+  var p0 = raw[3];
+  var p1 = raw[4];
+  var r0 = raw[5];
+  var r1 = raw[6];
+
+  var curMatrix = ctx.mozCurrentTransform;
+  if (curMatrix) {
+    var userMatrix = ctx.mozCurrentTransformInverse;
+
+    p0 = Util.applyTransform(p0, curMatrix);
+    p0 = Util.applyTransform(p0, userMatrix);
+
+    p1 = Util.applyTransform(p1, curMatrix);
+    p1 = Util.applyTransform(p1, userMatrix);
+  }
+
+  if (type == 2)
+    var grad = ctx.createLinearGradient(p0[0], p0[1], p1[0], p1[1]);
+  else if (type == 3)
+    var grad = ctx.createRadialGradient(p0[0], p0[1], r0, p1[0], p1[1], r1);
+
+  for (var i = 0, ii = colorStops.length; i < ii; ++i) {
+    var c = colorStops[i];
+    grad.addColorStop(c[0], c[1]);
+  }
+  return grad;
+}
