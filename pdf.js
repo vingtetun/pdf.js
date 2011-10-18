@@ -941,7 +941,7 @@ var JpegStream = (function jpegStream() {
   }
 
   constructor.prototype = {
-    getIR: function() {
+    serialize: function() {
       return this.src;
     },
     getChar: function jpegStreamGetChar() {
@@ -4604,7 +4604,7 @@ var PartialEvaluator = (function partialEvaluator() {
 
         if (image instanceof JpegStream) {
           var objId = 'img_' + uniquePrefix + ++self.objIdCounter;
-          handler.send('obj', [objId, 'JpegStream', image.getIR()]);
+          handler.send('obj', [objId, 'JpegStream', image.serialize()]);
 
           // Add the dependency on the image object.
           insertDependency([objId]);
@@ -4720,7 +4720,7 @@ var PartialEvaluator = (function partialEvaluator() {
                   // codeIR.
                   insertDependency(dependency.slice(depIdx));
 
-                  args = TilingPattern.getIR(codeIR, dict, args);
+                  args = TilingPattern.serialize(codeIR, dict, args);
                 }
                 // Type2 is ShadingPattern.
                 else if (typeNum == 2) {
@@ -4728,7 +4728,7 @@ var PartialEvaluator = (function partialEvaluator() {
                   var matrix = dict.get('Matrix');
                   var pattern = Pattern.parseShading(shading, matrix, xref, res,
                                                                   null /*ctx*/);
-                  args = pattern.getIR();
+                  args = pattern.serialize();
                 } else {
                   error('Unkown PatternType ' + typeNum);
                 }
@@ -4797,7 +4797,7 @@ var PartialEvaluator = (function partialEvaluator() {
 
             var shadingFill = Pattern.parseShading(shading, null, xref, res,
                                                                 /* ctx */ null);
-            var patternIR = shadingFill.getIR();
+            var patternIR = shadingFill.serialize();
 
             args = [patternIR];
             fn = 'shadingFill';
@@ -5404,13 +5404,13 @@ var ColorSpace = (function colorSpaceColorSpace() {
   constructor.parse = function colorspace_parse(cs, xref, res) {
     var IR = constructor.parseToIR(cs, xref, res, true);
     if (!(IR instanceof SeparationCS)) {
-      return constructor.fromIR(IR);
+      return constructor.unserialize(IR);
     } else {
       return IR;
     }
   };
 
-  constructor.fromIR = function(IR) {
+  constructor.unserialize = function(IR) {
     var name;
     if (isArray(IR)) {
       name = IR[0];
@@ -5430,20 +5430,20 @@ var ColorSpace = (function colorSpaceColorSpace() {
         if (baseCS == null) {
           return new PatternCS(null);
         } else {
-          return new PatternCS(ColorSpace.fromIR(baseCS));
+          return new PatternCS(ColorSpace.unserialize(baseCS));
         }
       case 'IndexedCS':
         var baseCS = IR[1];
         var hiVal = IR[2];
         var lookup = IR[3];
-        return new IndexedCS(ColorSpace.fromIR(baseCS), hiVal, lookup);
+        return new IndexedCS(ColorSpace.unserialize(baseCS), hiVal, lookup);
       case 'SeparationCS':
         var alt = IR[1];
         var tintFnIR = IR[2];
 
         return new SeparationCS(
-          ColorSpace.fromIR(alt),
-          PDFFunction.fromIR(tintFnIR)
+          ColorSpace.unserialize(alt),
+          PDFFunction.unserialize(tintFnIR)
         );
       default:
         error('Unkown name ' + name);
@@ -5523,7 +5523,7 @@ var ColorSpace = (function colorSpaceColorSpace() {
         return ['IndexedCS', baseCS, hiVal, lookup];
       case 'Separation':
         var alt = ColorSpace.parseToIR(cs[2], xref, res);
-        var tintFnIR = PDFFunction.getIR(xref, xref.fetchIfRef(cs[3]));
+        var tintFnIR = PDFFunction.serialize(xref, xref.fetchIfRef(cs[3]));
         return ['SeparationCS', alt, tintFnIR];
       case 'Lab':
       case 'DeviceN':
@@ -5817,12 +5817,12 @@ var DummyShading = (function dummyShading() {
     this.type = 'Pattern';
   }
 
-  constructor.fromIR = function() {
+  constructor.unserialize = function() {
     return 'hotpink';
   }
 
   constructor.prototype = {
-    getIR: function dummpy_getir() {
+    serialize: function dummpy_getir() {
       return ['DummyShading'];
     }
   };
@@ -5885,7 +5885,7 @@ var RadialAxialShading = (function radialAxialShading() {
     this.colorStops = colorStops;
   }
 
-  constructor.fromIR = function(ctx, raw) {
+  constructor.unserialize = function(ctx, raw) {
     var type = raw[1];
     var colorStops = raw[2];
     var p0 = raw[3];
@@ -5917,7 +5917,7 @@ var RadialAxialShading = (function radialAxialShading() {
   }
 
   constructor.prototype = {
-    getIR: function RadialAxialShading_getIR() {
+    serialize: function RadialAxialShading_serialize() {
       var coordsArr = this.coordsArr;
       var type = this.shadingType;
       if (type == 2) {
@@ -5948,7 +5948,7 @@ var RadialAxialShading = (function radialAxialShading() {
 })();
 
 var TilingPattern = {
-  getIR: function(codeIR, dict, args) {
+  serialize: function(codeIR, dict, args) {
     var matrix = dict.get('Matrix');
     var bbox = dict.get('BBox');
     var xstep = dict.get('XStep');
@@ -6220,7 +6220,7 @@ var PDFFunction = (function() {
       return array;
     },
 
-    getIR: function(xref, fn) {
+    serialize: function(xref, fn) {
       var dict = fn.dict;
       if (!dict)
         dict = fn;
@@ -6239,7 +6239,7 @@ var PDFFunction = (function() {
       return typeFn.call(this, fn, dict, xref);
     },
 
-    fromIR: function(IR) {
+    unserialize: function(IR) {
       var type = IR[0];
       switch (type) {
         case CONSTRUCT_SAMPLED:
@@ -6254,8 +6254,8 @@ var PDFFunction = (function() {
     },
 
     parse: function(xref, fn) {
-      var IR = this.getIR(xref, fn);
-      return this.fromIR(IR);
+      var IR = this.serialize(xref, fn);
+      return this.unserialize(IR);
     },
 
     constructSampled: function(str, dict) {
@@ -6422,7 +6422,7 @@ var PDFFunction = (function() {
       var fnRefs = dict.get('Functions');
       var fns = [];
       for (var i = 0, ii = fnRefs.length; i < ii; ++i)
-        fns.push(PDFFunction.getIR(xref, xref.fetchIfRef(fnRefs[i])));
+        fns.push(PDFFunction.serialize(xref, xref.fetchIfRef(fnRefs[i])));
 
       var bounds = dict.get('Bounds');
       var encode = dict.get('Encode');
@@ -6438,7 +6438,7 @@ var PDFFunction = (function() {
       var fns = [];
 
       for (var i = 0; i < fnsIR.length; i++) {
-        fns.push(PDFFunction.fromIR(fnsIR[i]));
+        fns.push(PDFFunction.unserialize(fnsIR[i]));
       }
 
       return function(args) {

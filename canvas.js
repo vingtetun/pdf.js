@@ -483,11 +483,11 @@ var CanvasGraphics = (function canvasGraphics() {
     setStrokeColorSpace:
     function canvasGraphicsSetStrokeColorSpacefunction(raw) {
       this.current.strokeColorSpace =
-            ColorSpaceIR.fromIR(raw);
+            ColorSpace.unserialize(raw);
     },
     setFillColorSpace: function canvasGraphicsSetFillColorSpace(raw) {
       this.current.fillColorSpace =
-            ColorSpaceIR.fromIR(raw);
+            ColorSpace.unserialize(raw);
     },
     setStrokeColor: function canvasGraphicsSetStrokeColor(/*...*/) {
       var cs = this.current.strokeColorSpace;
@@ -920,53 +920,10 @@ var JpegStreamIR = (function() {
 })();
 
 
-var ColorSpaceIR = {
-  fromIR: function(IR) {
-    var name;
-    if (isArray(IR)) {
-      name = IR[0];
-    } else {
-      name = IR;
-    }
-
-    switch (name) {
-      case 'DeviceGrayCS':
-        return new DeviceGrayCS();
-      case 'DeviceRgbCS':
-        return new DeviceRgbCS();
-      case 'DeviceCmykCS':
-        return new DeviceCmykCS();
-      case 'PatternCS':
-        var baseCS = IR[1];
-        if (baseCS == null) {
-          return new PatternCS(null);
-        } else {
-          return new PatternCS(ColorSpace.fromIR(baseCS));
-        }
-      case 'IndexedCS':
-        var baseCS = IR[1];
-        var hiVal = IR[2];
-        var lookup = IR[3];
-        return new IndexedCS(ColorSpace.fromIR(baseCS), hiVal, lookup);
-      case 'SeparationCS':
-        var alt = IR[1];
-        var tintFnIR = IR[2];
-
-        return new SeparationCS(
-          ColorSpace.fromIR(alt),
-          PDFFunction.fromIR(tintFnIR)
-        );
-      default:
-        error('Unkown name ' + name);
-    }
-    return null;
-  }
-};
-
 var PatternIR = {
   shadingFromIR: function(ctx, raw) {
     var obj = window[raw[0]];
-    return obj.fromIR(ctx, raw);
+    return obj.unserialize(ctx, raw);
   }
 };
 
