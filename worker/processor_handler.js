@@ -18,11 +18,6 @@ var WorkerProcessorHandler = {
 
       var page = pdfDoc.getPage(pageNum);
 
-      // The following code does quite the same as
-      // Page.prototype.startRendering, but stops at one point and sends the
-      // result back to the main thread.
-      var gfx = new CanvasGraphics(null);
-
       var start = Date.now();
 
       var dependency = [];
