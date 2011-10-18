@@ -483,11 +483,11 @@ var CanvasGraphics = (function canvasGraphics() {
     setStrokeColorSpace:
     function canvasGraphicsSetStrokeColorSpacefunction(raw) {
       this.current.strokeColorSpace =
-            ColorSpace.fromIR(raw);
+            ColorSpace.unserialize(raw);
     },
     setFillColorSpace: function canvasGraphicsSetFillColorSpace(raw) {
       this.current.fillColorSpace =
-            ColorSpace.fromIR(raw);
+            ColorSpace.unserialize(raw);
     },
     setStrokeColor: function canvasGraphicsSetStrokeColor(/*...*/) {
       var cs = this.current.strokeColorSpace;

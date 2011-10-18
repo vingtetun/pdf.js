@@ -127,7 +127,7 @@ function getPdf(arg, callback) {
   xhr.expected = (document.URL.indexOf('file:') === 0) ? 0 : 200;
 
   if ('progress' in params)
-    xhr.onprogress = params.progress || undefined;
+    xhr.onprogrss = params.progress || undefined;
 
   if ('error' in params)
     xhr.onerror = params.error || undefined;
@@ -895,7 +895,6 @@ var PredictorStream = (function predictorStream() {
   return constructor;
 })();
 
-
 // A JpegStream can't be read directly. We use the platform to render
 // the underlying JPEG data for us.
 var JpegStream = (function jpegStream() {
@@ -930,22 +929,68 @@ var JpegStream = (function jpegStream() {
   }
 
   function constructor(bytes, dict) {
-    // TODO: per poppler, some images may have 'junk' before that
+    // TODO: per poppler, some images may have "junk" before that
     // need to be removed
     this.dict = dict;
 
     if (isAdobeImage(bytes))
       bytes = fixAdobeImage(bytes);
 
-    this.src = bytesToString(bytes);
+    // create DOM image
+    var img = new Image();
+    img.onload = (function jpegStreamOnload() {
+      this.loaded = true;
+      if (this.onLoad)
+        this.onLoad();
+    }).bind(this);
+    img.src = 'data:image/jpeg;base64,' + window.btoa(bytesToString(bytes));
+    this.domImage = img;
   }
 
   constructor.prototype = {
-    serialize: function() {
-      return this.src;
+    getImage: function jpegStreamGetImage() {
+      return this.domImage;
     },
     getChar: function jpegStreamGetChar() {
       error('internal error: getChar is not valid on JpegStream');
+    }
+  };
+
+  return constructor;
+})();
+
+// Simple object to track the loading images
+// Initialy for every that is in loading call imageLoading()
+// and, when images onload is fired, call imageLoaded()
+// When all images are loaded, the onLoad event is fired.
+var ImagesLoader = (function imagesLoader() {
+  function constructor() {
+    this.loading = 0;
+  }
+
+  constructor.prototype = {
+    imageLoading: function imagesLoaderImageLoading() {
+      ++this.loading;
+    },
+
+    imageLoaded: function imagesLoaderImageLoaded() {
+      if (--this.loading == 0 && this.onLoad) {
+        this.onLoad();
+        delete this.onLoad;
+      }
+    },
+
+    bind: function imagesLoaderBind(jpegStream) {
+      if (jpegStream.loaded)
+        return;
+      this.imageLoading();
+      jpegStream.onLoad = this.imageLoaded.bind(this);
+    },
+
+    notifyOnLoad: function imagesLoaderNotifyOnLoad(callback) {
+      if (this.loading == 0)
+        callback();
+      this.onLoad = callback;
     }
   };
 
@@ -3215,7 +3260,7 @@ var XRef = (function xRefXRef() {
       var stream = this.stream;
       stream.pos = 0;
       var buffer = stream.getBytes();
-      var position = stream.start, length = buffer.length;
+      var position = 0, length = buffer.length;
       var trailers = [], xrefStms = [];
       var state = 0;
       var currentToken;
@@ -3266,7 +3311,6 @@ var XRef = (function xRefXRef() {
           this.readXRef(xrefStms[i]);
       }
       // finding main trailer
-      var dict;
       for (var i = 0; i < trailers.length; ++i) {
         stream.pos = trailers[i];
         var parser = new Parser(new Lexer(stream), true);
@@ -3274,15 +3318,13 @@ var XRef = (function xRefXRef() {
         if (!isCmd(obj, 'trailer'))
           continue;
         // read the trailer dictionary
+        var dict;
         if (!isDict(dict = parser.getObj()))
           continue;
         // taking the first one with 'ID'
         if (dict.has('ID'))
           return dict;
       }
-      // no tailer with 'ID', taking last one (if exists)
-      if (dict)
-        return dict;
       // nothing helps
       error('Invalid PDF structure');
       return null;
@@ -3360,8 +3402,8 @@ var XRef = (function xRefXRef() {
         } else {
           e = parser.getObj();
         }
-        // Don't cache streams since they are mutable (except images).
-        if (!isStream(e) || e.getImage)
+        // Don't cache streams since they are mutable.
+        if (!isStream(e))
           this.cache[num] = e;
         return e;
       }
@@ -3509,38 +3551,52 @@ var Page = (function pagePage() {
       }
       return shadow(this, 'rotate', rotate);
     },
-
-    startRenderingFromIRQueue: function startRenderingFromIRQueue(gfx,
-                                                IRQueue, fonts, continuation) {
+    startRendering: function pageStartRendering(canvasCtx, continuation) {
       var self = this;
-      this.IRQueue = IRQueue;
+      var stats = self.stats;
+      stats.compile = stats.fonts = stats.render = 0;
+
+      var gfx = new CanvasGraphics(canvasCtx);
+      var fonts = [];
+      var images = new ImagesLoader();
+
+      this.compile(gfx, fonts, images);
+      stats.compile = Date.now();
 
       var displayContinuation = function pageDisplayContinuation() {
-        console.log('--display--');
-
         // Always defer call to display() to work around bug in
         // Firefox error reporting from XHR callbacks.
         setTimeout(function pageSetTimeout() {
           var exc = null;
           try {
-            self.display(gfx, continuation);
+            self.display(gfx);
+            stats.render = Date.now();
           } catch (e) {
             exc = e.toString();
-            continuation(exc);
-            throw e;
           }
+          if (continuation) continuation(exc);
         });
       };
 
-      this.ensureFonts(fonts, function() {
-        displayContinuation();
-      });
+      var fontObjs = FontLoader.bind(
+        fonts,
+        function pageFontObjs() {
+          stats.fonts = Date.now();
+          images.notifyOnLoad(function pageNotifyOnLoad() {
+            stats.images = Date.now();
+            displayContinuation();
+          });
+        });
+
+      for (var i = 0, ii = fonts.length; i < ii; ++i)
+        fonts[i].dict.fontObj = fontObjs[i];
     },
 
-    getIRQueue: function(handler, dependency) {
-      if (this.IRQueue) {
+
+    compile: function pageCompile(gfx, fonts, images) {
+      if (this.code) {
         // content was compiled
-        return this.IRQueue;
+        return;
       }
 
       var xref = this.xref;
@@ -3553,62 +3609,21 @@ var Page = (function pagePage() {
           content[i] = xref.fetchIfRef(content[i]);
         content = new StreamsSequenceStream(content);
       }
-
-      var pe = this.pe = new PartialEvaluator(
-                                xref, handler, 'p' + this.pageNumber + '_');
-      var IRQueue = {};
-      return this.IRQueue = pe.getIRQueue(
-                                content, resources, IRQueue, dependency);
+      this.code = gfx.compile(content, xref, resources, fonts, images);
     },
-
-    ensureFonts: function(fonts, callback) {
-      console.log('--ensureFonts--', '' + fonts);
-      // Convert the font names to the corresponding font obj.
-      for (var i = 0; i < fonts.length; i++) {
-        fonts[i] = this.objs.objs[fonts[i]].data;
-      }
-
-      // Load all the fonts
-      var fontObjs = FontLoader.bind(
-        fonts,
-        function(fontObjs) {
-          this.stats.fonts = Date.now();
-
-          callback.call(this);
-        }.bind(this),
-        this.objs
-      );
-    },
-
-    display: function(gfx, callback) {
+    display: function pageDisplay(gfx) {
+      assert(this.code instanceof Function,
+             'page content must be compiled first');
       var xref = this.xref;
       var resources = xref.fetchIfRef(this.resources);
       var mediaBox = xref.fetchIfRef(this.mediaBox);
       assertWellFormed(isDict(resources), 'invalid page resources');
-
-      gfx.xref = xref;
-      gfx.res = resources;
       gfx.beginDrawing({ x: mediaBox[0], y: mediaBox[1],
             width: this.width,
             height: this.height,
             rotate: this.rotate });
-
-      var startIdx = 0;
-      var length = this.IRQueue.fnArray.length;
-      var IRQueue = this.IRQueue;
-
-      var self = this;
-      var startTime = Date.now();
-      function next() {
-        startIdx = gfx.executeIRQueue(IRQueue, startIdx, next);
-        if (startIdx == length) {
-          self.stats.render = Date.now();
-          console.log('page=%d - executeIRQueue: time=%dms',
-            self.pageNumber + 1, self.stats.render - startTime);
-          callback();
-        }
-      }
-      next();
+      gfx.execute(this.code, xref, resources);
+      gfx.endDrawing();
     },
     rotatePoint: function pageRotatePoint(x, y) {
       var rotate = this.rotate;
@@ -3832,17 +3847,7 @@ var Catalog = (function catalogCatalog() {
   return constructor;
 })();
 
-/**
- * The `PDFDocModel` holds all the data of the PDF file. Compared to the
- * `PDFDoc`, this one doesn't have any job management code.
- * Right now there exists one PDFDocModel on the main thread + one object
- * for each worker. If there is no worker support enabled, there are two
- * `PDFDocModel` objects on the main thread created.
- * TODO: Refactor the internal object structure, such that there is no
- * need for the `PDFDocModel` anymore and there is only one object on the
- * main thread and not one entire copy on each worker instance.
- */
-var PDFDocModel = (function pdfDoc() {
+var PDFDoc = (function pdfDoc() {
   function constructor(arg, callback) {
     // Stream argument
     if (typeof arg.isStream !== 'undefined') {
@@ -3960,176 +3965,6 @@ var PDFDocModel = (function pdfDoc() {
     },
     getPage: function pdfDocGetPage(n) {
       return this.catalog.getPage(n);
-    }
-  };
-
-  return constructor;
-})();
-
-var PDFDoc = (function() {
-  function constructor(arg, callback) {
-    var stream = null;
-    var data = null;
-
-    // Stream argument
-    if (typeof arg.isStream !== 'undefined') {
-      stream = arg;
-      data = arg.bytes;
-    }
-    // ArrayBuffer argument
-    else if (typeof arg.byteLength !== 'undefined') {
-      stream = new Stream(arg);
-      data = arg;
-    }
-    else {
-      error('Unknown argument type');
-    }
-
-    this.data = data;
-    this.stream = stream;
-    this.pdf = new PDFDocModel(stream);
-
-    this.catalog = this.pdf.catalog;
-    this.objs = new PDFObjects();
-
-    this.pageCache = [];
-
-    if (useWorker) {
-      var worker = this.worker = new Worker('../worker/pdf_worker_loader.js');
-    } else {
-      // If we don't use a worker, just post/sendMessage to the main thread.
-      var worker = {
-        postMessage: function(obj) {
-          worker.onmessage({data: obj});
-        }
-      };
-    }
-
-    this.fontsLoading = {};
-
-    var processorHandler = this.processorHandler =
-                                        new MessageHandler('main', worker);
-
-    processorHandler.on('page', function(data) {
-      var pageNum = data.pageNum;
-      var page = this.pageCache[pageNum];
-      var depFonts = data.depFonts;
-
-      page.startRenderingFromIRQueue(data.IRQueue, depFonts);
-    }, this);
-
-    processorHandler.on('obj', function(data) {
-      var objId = data[0];
-      var objType = data[1];
-
-      switch (objType) {
-        case 'JpegStream':
-          var IR = data[2];
-          new JpegStreamIR(objId, IR, this.objs);
-          console.log('got image');
-        break;
-        case 'Font':
-          var name = data[2];
-          var file = data[3];
-          var properties = data[4];
-
-          if (file) {
-            var fontFileDict = new Dict();
-            fontFileDict.map = file.dict.map;
-
-            var fontFile = new Stream(file.bytes, file.start,
-                                      file.end - file.start, fontFileDict);
-
-            // Check if this is a FlateStream. Otherwise just use the created
-            // Stream one. This makes complex_ttf_font.pdf work.
-            var cmf = file.bytes[0];
-            if ((cmf & 0x0f) == 0x08) {
-              file = new FlateStream(fontFile);
-            } else {
-              file = fontFile;
-            }
-          }
-
-          // For now, resolve the font object here direclty. The real font
-          // object is then created in FontLoader.bind().
-          this.objs.resolve(objId, {
-            name: name,
-            file: file,
-            properties: properties
-          });
-        break;
-        default:
-          throw 'Got unkown object type ' + objType;
-      }
-    }, this);
-
-    processorHandler.on('font_ready', function(data) {
-      var objId = data[0];
-      var fontObj = new FontShape(data[1]);
-
-      console.log('got fontData', objId);
-
-      // If there is no string, then there is nothing to attach to the DOM.
-      if (!fontObj.str) {
-        this.objs.resolve(objId, fontObj);
-      } else {
-        this.objs.setData(objId, fontObj);
-      }
-    }.bind(this));
-
-    if (!useWorker) {
-      // If the main thread is our worker, setup the handling for the messages
-      // the main thread sends to it self.
-      WorkerProcessorHandler.setup(processorHandler);
-    }
-
-    this.workerReadyPromise = new Promise('workerReady');
-    setTimeout(function() {
-      processorHandler.send('doc', this.data);
-      this.workerReadyPromise.resolve(true);
-    }.bind(this));
-  }
-
-  constructor.prototype = {
-    get numPages() {
-      return this.pdf.numPages;
-    },
-
-    startRendering: function(page) {
-      // The worker might not be ready to receive the page request yet.
-      this.workerReadyPromise.then(function() {
-        this.processorHandler.send('page_request', page.page.pageNumber + 1);
-      }.bind(this));
-    },
-
-    getPage: function(n) {
-      if (this.pageCache[n]) {
-        return this.pageCache[n];
-      }
-
-      var page = this.pdf.getPage(n);
-      // Add a reference to the objects such that Page can forward the reference
-      // to the CanvasGraphics and so on.
-      page.objs = this.objs;
-      return this.pageCache[n] = new WorkerPage(this, page, this.objs);
-    },
-
-    destroy: function() {
-      console.log('destroy worker');
-      if (this.worker) {
-        this.worker.terminate();
-      }
-      if (this.fontWorker) {
-        this.fontWorker.terminate();
-      }
-
-      for (var n in this.pageCache) {
-        delete this.pageCache[n];
-      }
-      delete this.data;
-      delete this.stream;
-      delete this.pdf;
-      delete this.catalog;
     }
   };
 
@@ -4427,14 +4262,9 @@ var EvalState = (function evalState() {
 })();
 
 var PartialEvaluator = (function partialEvaluator() {
-  function constructor(xref, handler, uniquePrefix) {
+  function constructor() {
     this.state = new EvalState();
     this.stateStack = [];
-
-    this.xref = xref;
-    this.handler = handler;
-    this.uniquePrefix = uniquePrefix;
-    this.objIdCounter = 0;
   }
 
   var OP_MAP = {
@@ -4535,171 +4365,22 @@ var PartialEvaluator = (function partialEvaluator() {
   };
 
   constructor.prototype = {
-    getIRQueue: function partialEvaluatorGetIRQueue(stream, resources,
-                                    queue, dependency) {
-
-      var self = this;
-      var xref = this.xref;
-      var handler = this.handler;
-      var uniquePrefix = this.uniquePrefix;
-
-      function insertDependency(depList) {
-        fnArray.push('dependency');
-        argsArray.push(depList);
-        for (var i = 0; i < depList.length; i++) {
-          var dep = depList[i];
-          if (dependency.indexOf(dep) == -1) {
-            dependency.push(depList[i]);
-          }
-        }
-      }
-
-      function handleSetFont(fontName, fontRef) {
-        var loadedName = null;
-
-        var fontRes = resources.get('Font');
-        if (fontRes) {
-          fontRes = xref.fetchIfRef(fontRes);
-          fontRef = fontRef || fontRes.get(fontName);
-          var font = xref.fetchIfRef(fontRef);
-          assertWellFormed(isDict(font));
-          if (!font.translated) {
-            font.translated = self.translateFont(font, xref, resources, handler,
-                          uniquePrefix, dependency);
-            if (font.translated) {
-              // keep track of each font we translated so the caller can
-              // load them asynchronously before calling display on a page
-              loadedName = 'font_' + uniquePrefix + ++self.objIdCounter;
-              font.translated.properties.loadedName = loadedName;
-              font.loadedName = loadedName;
-
-              handler.send('obj', [
-                  loadedName,
-                  'Font',
-                  font.translated.name,
-                  font.translated.file,
-                  font.translated.properties
-              ]);
-            }
-          }
-          loadedName = loadedName || font.loadedName;
-
-          // Ensure the font is ready before the font is set
-          // and later on used for drawing.
-          // TODO: This should get insert to the IRQueue only once per
-          // page.
-          insertDependency([loadedName]);
-          return loadedName;
-        } else {
-          // TODO: TOASK: Is it possible to get here? If so, what does
-          // args[0].name should be like???
-          return null;
-        }
-      }
-
-      function buildPaintImageXObject(image, inline) {
-        var dict = image.dict;
-        var w = dict.get('Width', 'W');
-        var h = dict.get('Height', 'H');
-
-        if (image instanceof JpegStream) {
-          var objId = 'img_' + uniquePrefix + ++self.objIdCounter;
-          handler.send('obj', [objId, 'JpegStream', image.serialize()]);
-
-          // Add the dependency on the image object.
-          insertDependency([objId]);
-
-          // The normal fn.
-          fn = 'paintJpegXObject';
-          args = [objId, w, h];
-        } else {
-          // Needs to be rendered ourself.
-
-          // Figure out if the image has an imageMask.
-          var imageMask = dict.get('ImageMask', 'IM') || false;
-
-          // If there is no imageMask, create the PDFImage and a lot
-          // of image processing can be done here.
-          if (!imageMask) {
-            var imageObj = new PDFImage(xref, resources, image, inline);
-
-            if (imageObj.imageMask) {
-              throw 'Can\'t handle this in the web worker :/';
-            }
-
-            var imgData = {
-              width: w,
-              height: h,
-              data: new Uint8Array(w * h * 4)
-            };
-            var pixels = imgData.data;
-            imageObj.fillRgbaBuffer(pixels, imageObj.decode);
-
-            fn = 'paintImageXObject';
-            args = [imgData];
-          } else /* imageMask == true */ {
-            // This depends on a tmpCanvas beeing filled with the
-            // current fillStyle, such that processing the pixel
-            // data can't be done here. Instead of creating a
-            // complete PDFImage, only read the information needed
-            // for later.
-            fn = 'paintImageMaskXObject';
-
-            var width = dict.get('Width', 'W');
-            var height = dict.get('Height', 'H');
-            var bitStrideLength = (width + 7) >> 3;
-            var imgArray = image.getBytes(bitStrideLength * height);
-            var decode = dict.get('Decode', 'D');
-            var inverseDecode = !!decode && decode[0] > 0;
-
-            args = [imgArray, inverseDecode, width, height];
-          }
-        }
-      }
-
-      uniquePrefix = uniquePrefix || '';
-      if (!queue.argsArray) {
-        queue.argsArray = [];
-      }
-      if (!queue.fnArray) {
-        queue.fnArray = [];
-      }
-
-      var fnArray = queue.fnArray, argsArray = queue.argsArray;
-      var dependency = dependency || [];
-
+    evaluate: function partialEvaluatorEvaluate(stream, xref, resources, fonts,
+                                                images) {
       resources = xref.fetchIfRef(resources) || new Dict();
       var xobjs = xref.fetchIfRef(resources.get('XObject')) || new Dict();
       var patterns = xref.fetchIfRef(resources.get('Pattern')) || new Dict();
       var parser = new Parser(new Lexer(stream), false);
-      var args = [], obj;
-      var res = resources;
+      var args = [], argsArray = [], fnArray = [], obj;
 
       while (!isEOF(obj = parser.getObj())) {
         if (isCmd(obj)) {
           var cmd = obj.cmd;
           var fn = OP_MAP[cmd];
-          if (!fn) {
-            // invalid content command, trying to recover
-            if (cmd.substr(-2) == 'BT') {
-              fn = OP_MAP[cmd.substr(0, cmd.length - 2)];
-              // feeding 'BT' on next interation
-              parser = {
-                getObj: function() {
-                  parser = this.oldParser;
-                  return { name: 'BT' };
-                },
-                oldParser: parser
-              };
-            }
-          }
-          assertWellFormed(fn, 'Unknown command "' + cmd + '"');
+          assertWellFormed(fn, "Unknown command '" + cmd + "'");
           // TODO figure out how to type-check vararg functions
 
           if ((cmd == 'SCN' || cmd == 'scn') && !args[args.length - 1].code) {
-            // Use the IR version for setStroke/FillColorN.
-            fn += '_IR';
-
             // compile tiling patterns
             var patternName = args[args.length - 1];
             // SCN/scn applies patterns along with normal colors
@@ -4708,29 +4389,10 @@ var PartialEvaluator = (function partialEvaluator() {
               if (pattern) {
                 var dict = isStream(pattern) ? pattern.dict : pattern;
                 var typeNum = dict.get('PatternType');
-
-                // Type1 is TilingPattern
                 if (typeNum == 1) {
-                  // Create an IR of the pattern code.
-                  var depIdx = dependency.length;
-                  var codeIR = this.getIRQueue(pattern,
-                                    dict.get('Resources'), {}, dependency);
-
-                  // Add the dependencies that are required to execute the
-                  // codeIR.
-                  insertDependency(dependency.slice(depIdx));
-
-                  args = TilingPattern.serialize(codeIR, dict, args);
-                }
-                // Type2 is ShadingPattern.
-                else if (typeNum == 2) {
-                  var shading = xref.fetchIfRef(dict.get('Shading'));
-                  var matrix = dict.get('Matrix');
-                  var pattern = Pattern.parseShading(shading, matrix, xref, res,
-                                                                  null /*ctx*/);
-                  args = pattern.serialize();
-                } else {
-                  error('Unkown PatternType ' + typeNum);
+                  patternName.code = this.evaluate(pattern, xref,
+                                                   dict.get('Resources'),
+                                                   fonts, images);
                 }
               }
             }
@@ -4749,118 +4411,27 @@ var PartialEvaluator = (function partialEvaluator() {
               );
 
               if ('Form' == type.name) {
-                var matrix = xobj.dict.get('Matrix');
-                var bbox = xobj.dict.get('BBox');
-
-                fnArray.push('paintFormXObjectBegin');
-                argsArray.push([matrix, bbox]);
-
-                // This adds the IRQueue of the xObj to the current queue.
-                var depIdx = dependency.length;
-
-                this.getIRQueue(xobj, xobj.dict.get('Resources'), queue,
-                                                                dependency);
-
-               // Add the dependencies that are required to execute the
-               // codeIR.
-               insertDependency(dependency.slice(depIdx));
-
-                fn = 'paintFormXObjectEnd';
-                args = [];
-              } else if ('Image' == type.name) {
-                buildPaintImageXObject(xobj, false);
-              } else {
-                error('Unhandled XObject subtype ' + type.name);
+                args[0].code = this.evaluate(xobj, xref,
+                                             xobj.dict.get('Resources'), fonts,
+                                             images);
               }
+              if (xobj instanceof JpegStream)
+                images.bind(xobj); // monitoring image load
             }
           } else if (cmd == 'Tf') { // eagerly collect all fonts
-            args[0].name = handleSetFont(args[0].name);
-          } else if (cmd == 'EI') {
-            buildPaintImageXObject(args[0], true);
-          }
-
-          // Transform some cmds.
-          switch (fn) {
-          // Parse the ColorSpace data to a raw format.
-          case 'setFillColorSpace':
-          case 'setStrokeColorSpace':
-            args = [ColorSpace.parseToIR(args[0], xref, resources)];
-            break;
-          case 'shadingFill':
-            var shadingRes = xref.fetchIfRef(res.get('Shading'));
-            if (!shadingRes)
-              error('No shading resource found');
-
-            var shading = xref.fetchIfRef(shadingRes.get(args[0].name));
-            if (!shading)
-              error('No shading object found');
-
-            var shadingFill = Pattern.parseShading(shading, null, xref, res,
-                                                                /* ctx */ null);
-            var patternIR = shadingFill.serialize();
-
-            args = [patternIR];
-            fn = 'shadingFill';
-
-            break;
-          case 'setGState':
-            var dictName = args[0];
-            var extGState = xref.fetchIfRef(resources.get('ExtGState'));
-            if (isDict(extGState) && extGState.has(dictName.name)) {
-              var gsState = xref.fetchIfRef(extGState.get(dictName.name));
-
-              // This array holds the converted/processed state data.
-              var gsStateObj = [];
-
-              gsState.forEach(
-              function canvasGraphicsSetGStateForEach(key, value) {
-                switch (key) {
-                  case 'Type':
-                    break;
-                  case 'LW':
-                  case 'LC':
-                  case 'LJ':
-                  case 'ML':
-                  case 'D':
-                  case 'RI':
-                  case 'FL':
-                    gsStateObj.push([key, value]);
-                    break;
-                  case 'Font':
-                    gsStateObj.push([
-                      'Font',
-                      // isRef(value[0]) === true -> pass in as ref and not as
-                      // font name.
-                      handleSetFont(null, value[0]),
-                      value[1]
-                    ]);
-                    break;
-                  case 'OP':
-                  case 'op':
-                  case 'OPM':
-                  case 'BG':
-                  case 'BG2':
-                  case 'UCR':
-                  case 'UCR2':
-                  case 'TR':
-                  case 'TR2':
-                  case 'HT':
-                  case 'SM':
-                  case 'SA':
-                  case 'BM':
-                  case 'SMask':
-                  case 'CA':
-                  case 'ca':
-                  case 'AIS':
-                  case 'TK':
-                    TODO('graphic state operator ' + key);
-                    break;
-                  default:
-                    warn('Unknown graphic state operator ' + key);
-                    break;
+            var fontRes = resources.get('Font');
+            if (fontRes) {
+              fontRes = xref.fetchIfRef(fontRes);
+              var font = xref.fetchIfRef(fontRes.get(args[0].name));
+              assertWellFormed(isDict(font));
+              if (!font.translated) {
+                font.translated = this.translateFont(font, xref, resources);
+                if (fonts && font.translated) {
+                  // keep track of each font we translated so the caller can
+                  // load them asynchronously before calling display on a page
+                  fonts.push(font.translated);
                 }
-              });
-              args = [gsStateObj];
+              }
             }
           }
 
@@ -4873,9 +4444,9 @@ var PartialEvaluator = (function partialEvaluator() {
         }
       }
 
-      return {
-        fnArray: fnArray,
-        argsArray: argsArray
+      return function partialEvaluatorReturn(gfx) {
+        for (var i = 0, length = argsArray.length; i < length; i++)
+          gfx[fnArray[i]].apply(gfx, argsArray[i]);
       };
     },
 
@@ -5005,7 +4576,7 @@ var PartialEvaluator = (function partialEvaluator() {
         var glyph = differences[i];
         var replaceGlyph = true;
         if (!glyph) {
-          glyph = baseEncoding[i] || i;
+          glyph = baseEncoding[i];
           replaceGlyph = false;
         }
         var index = GlyphsUnicode[glyph] || i;
@@ -5015,7 +4586,7 @@ var PartialEvaluator = (function partialEvaluator() {
           width: isNum(width) ? width : properties.defaultWidth
         };
 
-        if (replaceGlyph || !glyphs[glyph])
+        if (glyph && (replaceGlyph || !glyphs[glyph]))
             glyphs[glyph] = map[i];
 
         // If there is no file, the character mapping can't be modified
@@ -5148,8 +4719,8 @@ var PartialEvaluator = (function partialEvaluator() {
       };
     },
 
-    translateFont: function partialEvaluatorTranslateFont(dict, xref, resources,
-                                    queue, handler, uniquePrefix, dependency) {
+    translateFont: function partialEvaluatorTranslateFont(dict, xref,
+                                                          resources) {
       var baseDict = dict;
       var type = dict.get('Subtype');
       assertWellFormed(isName(type), 'invalid font Subtype');
@@ -5167,7 +4738,7 @@ var PartialEvaluator = (function partialEvaluator() {
         if (isRef(df))
           df = xref.fetch(df);
 
-        dict = xref.fetchIfRef(isRef(df) ? df : df[0]);
+        dict = xref.fetch(isRef(df) ? df : df[0]);
 
         type = dict.get('Subtype');
         assertWellFormed(isName(type), 'invalid font Subtype');
@@ -5294,9 +4865,9 @@ var PartialEvaluator = (function partialEvaluator() {
         properties.resources = fontResources;
         for (var key in charProcs.map) {
           var glyphStream = xref.fetchIfRef(charProcs.map[key]);
-          var queue = {};
-          properties.glyphs[key].IRQueue = this.getIRQueue(glyphStream,
-                      fontResources, queue, dependency);
+          properties.glyphs[key].code = this.evaluate(glyphStream,
+                                                       xref,
+                                                       fontResources);
         }
       }
 
@@ -5362,6 +4933,789 @@ function ScratchCanvas(width, height) {
   return canvas;
 }
 
+var CanvasGraphics = (function canvasGraphics() {
+  function constructor(canvasCtx, imageCanvas) {
+    this.ctx = canvasCtx;
+    this.current = new CanvasExtraState();
+    this.stateStack = [];
+    this.pendingClip = null;
+    this.res = null;
+    this.xobjs = null;
+    this.ScratchCanvas = imageCanvas || ScratchCanvas;
+  }
+
+  var LINE_CAP_STYLES = ['butt', 'round', 'square'];
+  var LINE_JOIN_STYLES = ['miter', 'round', 'bevel'];
+  var NORMAL_CLIP = {};
+  var EO_CLIP = {};
+
+  constructor.prototype = {
+    beginDrawing: function canvasGraphicsBeginDrawing(mediaBox) {
+      var cw = this.ctx.canvas.width, ch = this.ctx.canvas.height;
+      this.ctx.save();
+      switch (mediaBox.rotate) {
+        case 0:
+          this.ctx.transform(1, 0, 0, -1, 0, ch);
+          break;
+        case 90:
+          this.ctx.transform(0, 1, 1, 0, 0, 0);
+          break;
+        case 180:
+          this.ctx.transform(-1, 0, 0, 1, cw, 0);
+          break;
+        case 270:
+          this.ctx.transform(0, -1, -1, 0, cw, ch);
+          break;
+      }
+      this.ctx.scale(cw / mediaBox.width, ch / mediaBox.height);
+    },
+
+    compile: function canvasGraphicsCompile(stream, xref, resources, fonts,
+                                            images) {
+      var pe = new PartialEvaluator();
+      return pe.evaluate(stream, xref, resources, fonts, images);
+    },
+
+    execute: function canvasGraphicsExecute(code, xref, resources) {
+      resources = xref.fetchIfRef(resources) || new Dict();
+      var savedXref = this.xref, savedRes = this.res, savedXobjs = this.xobjs;
+      this.xref = xref;
+      this.res = resources || new Dict();
+      this.xobjs = xref.fetchIfRef(this.res.get('XObject')) || new Dict();
+
+      code(this);
+
+      this.xobjs = savedXobjs;
+      this.res = savedRes;
+      this.xref = savedXref;
+    },
+
+    endDrawing: function canvasGraphicsEndDrawing() {
+      this.ctx.restore();
+    },
+
+    // Graphics state
+    setLineWidth: function canvasGraphicsSetLineWidth(width) {
+      this.ctx.lineWidth = width;
+    },
+    setLineCap: function canvasGraphicsSetLineCap(style) {
+      this.ctx.lineCap = LINE_CAP_STYLES[style];
+    },
+    setLineJoin: function canvasGraphicsSetLineJoin(style) {
+      this.ctx.lineJoin = LINE_JOIN_STYLES[style];
+    },
+    setMiterLimit: function canvasGraphicsSetMiterLimit(limit) {
+      this.ctx.miterLimit = limit;
+    },
+    setDash: function canvasGraphicsSetDash(dashArray, dashPhase) {
+      this.ctx.mozDash = dashArray;
+      this.ctx.mozDashOffset = dashPhase;
+    },
+    setRenderingIntent: function canvasGraphicsSetRenderingIntent(intent) {
+      TODO('set rendering intent: ' + intent);
+    },
+    setFlatness: function canvasGraphicsSetFlatness(flatness) {
+      TODO('set flatness: ' + flatness);
+    },
+    setGState: function canvasGraphicsSetGState(dictName) {
+      var extGState = this.xref.fetchIfRef(this.res.get('ExtGState'));
+      if (isDict(extGState) && extGState.has(dictName.name)) {
+        var gsState = this.xref.fetchIfRef(extGState.get(dictName.name));
+        var self = this;
+        gsState.forEach(function canvasGraphicsSetGStateForEach(key, value) {
+          switch (key) {
+            case 'Type':
+              break;
+            case 'LW':
+              self.setLineWidth(value);
+              break;
+            case 'LC':
+              self.setLineCap(value);
+              break;
+            case 'LJ':
+              self.setLineJoin(value);
+              break;
+            case 'ML':
+              self.setMiterLimit(value);
+              break;
+            case 'D':
+              self.setDash(value[0], value[1]);
+              break;
+            case 'RI':
+              self.setRenderingIntent(value);
+              break;
+            case 'FL':
+              self.setFlatness(value);
+              break;
+            case 'Font':
+              self.setFont(value[0], value[1]);
+              break;
+            case 'OP':
+            case 'op':
+            case 'OPM':
+            case 'BG':
+            case 'BG2':
+            case 'UCR':
+            case 'UCR2':
+            case 'TR':
+            case 'TR2':
+            case 'HT':
+            case 'SM':
+            case 'SA':
+            case 'BM':
+            case 'SMask':
+            case 'CA':
+            case 'ca':
+            case 'AIS':
+            case 'TK':
+              TODO('graphic state operator ' + key);
+              break;
+            default:
+              warn('Unknown graphic state operator ' + key);
+              break;
+          }
+        });
+      }
+
+    },
+    save: function canvasGraphicsSave() {
+      this.ctx.save();
+      if (this.ctx.$saveCurrentX) {
+        this.ctx.$saveCurrentX();
+      }
+      var old = this.current;
+      this.stateStack.push(old);
+      this.current = old.clone();
+    },
+    restore: function canvasGraphicsRestore() {
+      var prev = this.stateStack.pop();
+      if (prev) {
+        if (this.ctx.$restoreCurrentX) {
+          this.ctx.$restoreCurrentX();
+        }
+        this.current = prev;
+        this.ctx.restore();
+      }
+    },
+    transform: function canvasGraphicsTransform(a, b, c, d, e, f) {
+      this.ctx.transform(a, b, c, d, e, f);
+    },
+
+    // Path
+    moveTo: function canvasGraphicsMoveTo(x, y) {
+      this.ctx.moveTo(x, y);
+      this.current.setCurrentPoint(x, y);
+    },
+    lineTo: function canvasGraphicsLineTo(x, y) {
+      this.ctx.lineTo(x, y);
+      this.current.setCurrentPoint(x, y);
+    },
+    curveTo: function canvasGraphicsCurveTo(x1, y1, x2, y2, x3, y3) {
+      this.ctx.bezierCurveTo(x1, y1, x2, y2, x3, y3);
+      this.current.setCurrentPoint(x3, y3);
+    },
+    curveTo2: function canvasGraphicsCurveTo2(x2, y2, x3, y3) {
+      var current = this.current;
+      this.ctx.bezierCurveTo(current.x, current.y, x2, y2, x3, y3);
+      current.setCurrentPoint(x3, y3);
+    },
+    curveTo3: function canvasGraphicsCurveTo3(x1, y1, x3, y3) {
+      this.curveTo(x1, y1, x3, y3, x3, y3);
+      this.current.setCurrentPoint(x3, y3);
+    },
+    closePath: function canvasGraphicsClosePath() {
+      this.ctx.closePath();
+    },
+    rectangle: function canvasGraphicsRectangle(x, y, width, height) {
+      this.ctx.rect(x, y, width, height);
+    },
+    stroke: function canvasGraphicsStroke() {
+      var ctx = this.ctx;
+      var strokeColor = this.current.strokeColor;
+      if (strokeColor && strokeColor.type === 'Pattern') {
+        // for patterns, we transform to pattern space, calculate
+        // the pattern, call stroke, and restore to user space
+        ctx.save();
+        ctx.strokeStyle = strokeColor.getPattern(ctx);
+        ctx.stroke();
+        ctx.restore();
+      } else {
+        ctx.stroke();
+      }
+
+      this.consumePath();
+    },
+    closeStroke: function canvasGraphicsCloseStroke() {
+      this.closePath();
+      this.stroke();
+    },
+    fill: function canvasGraphicsFill() {
+      var ctx = this.ctx;
+      var fillColor = this.current.fillColor;
+
+      if (fillColor && fillColor.type === 'Pattern') {
+        ctx.save();
+        ctx.fillStyle = fillColor.getPattern(ctx);
+        ctx.fill();
+        ctx.restore();
+      } else {
+        ctx.fill();
+      }
+
+      this.consumePath();
+    },
+    eoFill: function canvasGraphicsEoFill() {
+      var savedFillRule = this.setEOFillRule();
+      this.fill();
+      this.restoreFillRule(savedFillRule);
+    },
+    fillStroke: function canvasGraphicsFillStroke() {
+      var ctx = this.ctx;
+
+      var fillColor = this.current.fillColor;
+      if (fillColor && fillColor.type === 'Pattern') {
+        ctx.save();
+        ctx.fillStyle = fillColor.getPattern(ctx);
+        ctx.fill();
+        ctx.restore();
+      } else {
+        ctx.fill();
+      }
+
+      var strokeColor = this.current.strokeColor;
+      if (strokeColor && strokeColor.type === 'Pattern') {
+        ctx.save();
+        ctx.strokeStyle = strokeColor.getPattern(ctx);
+        ctx.stroke();
+        ctx.restore();
+      } else {
+        ctx.stroke();
+      }
+
+      this.consumePath();
+    },
+    eoFillStroke: function canvasGraphicsEoFillStroke() {
+      var savedFillRule = this.setEOFillRule();
+      this.fillStroke();
+      this.restoreFillRule(savedFillRule);
+    },
+    closeFillStroke: function canvasGraphicsCloseFillStroke() {
+      return this.fillStroke();
+    },
+    closeEOFillStroke: function canvasGraphicsCloseEOFillStroke() {
+      var savedFillRule = this.setEOFillRule();
+      this.fillStroke();
+      this.restoreFillRule(savedFillRule);
+    },
+    endPath: function canvasGraphicsEndPath() {
+      this.consumePath();
+    },
+
+    // Clipping
+    clip: function canvasGraphicsClip() {
+      this.pendingClip = NORMAL_CLIP;
+    },
+    eoClip: function canvasGraphicsEoClip() {
+      this.pendingClip = EO_CLIP;
+    },
+
+    // Text
+    beginText: function canvasGraphicsBeginText() {
+      this.current.textMatrix = IDENTITY_MATRIX;
+      if (this.ctx.$setCurrentX) {
+        this.ctx.$setCurrentX(0);
+      }
+      this.current.x = this.current.lineX = 0;
+      this.current.y = this.current.lineY = 0;
+    },
+    endText: function canvasGraphicsEndText() {
+    },
+    setCharSpacing: function canvasGraphicsSetCharSpacing(spacing) {
+      this.current.charSpacing = spacing;
+    },
+    setWordSpacing: function canvasGraphicsSetWordSpacing(spacing) {
+      this.current.wordSpacing = spacing;
+    },
+    setHScale: function canvasGraphicsSetHScale(scale) {
+      this.current.textHScale = scale / 100;
+    },
+    setLeading: function canvasGraphicsSetLeading(leading) {
+      this.current.leading = -leading;
+    },
+    setFont: function canvasGraphicsSetFont(fontRef, size) {
+      var font;
+      // the tf command uses a name, but graphics state uses a reference
+      if (isName(fontRef)) {
+        font = this.xref.fetchIfRef(this.res.get('Font'));
+        if (!isDict(font))
+         return;
+
+        font = font.get(fontRef.name);
+      } else if (isRef(fontRef)) {
+        font = fontRef;
+      }
+      font = this.xref.fetchIfRef(font);
+      if (!font)
+        error('Referenced font is not found');
+
+      var fontObj = font.fontObj;
+      this.current.font = fontObj;
+      this.current.fontSize = size;
+
+      var name = fontObj.loadedName || 'sans-serif';
+      if (this.ctx.$setFont) {
+        this.ctx.$setFont(name, size);
+      } else {
+        var bold = fontObj.black ? (fontObj.bold ? 'bolder' : 'bold') :
+                                   (fontObj.bold ? 'bold' : 'normal');
+
+        var italic = fontObj.italic ? 'italic' : 'normal';
+        var serif = fontObj.serif ? 'serif' : 'sans-serif';
+        var typeface = '"' + name + '", ' + serif;
+        var rule = italic + ' ' + bold + ' ' + size + 'px ' + typeface;
+        this.ctx.font = rule;
+      }
+    },
+    setTextRenderingMode: function canvasGraphicsSetTextRenderingMode(mode) {
+      TODO('text rendering mode: ' + mode);
+    },
+    setTextRise: function canvasGraphicsSetTextRise(rise) {
+      TODO('text rise: ' + rise);
+    },
+    moveText: function canvasGraphicsMoveText(x, y) {
+      this.current.x = this.current.lineX += x;
+      this.current.y = this.current.lineY += y;
+      if (this.ctx.$setCurrentX) {
+        this.ctx.$setCurrentX(this.current.x);
+      }
+    },
+    setLeadingMoveText: function canvasGraphicsSetLeadingMoveText(x, y) {
+      this.setLeading(-y);
+      this.moveText(x, y);
+    },
+    setTextMatrix: function canvasGraphicsSetTextMatrix(a, b, c, d, e, f) {
+      this.current.textMatrix = [a, b, c, d, e, f];
+
+      if (this.ctx.$setCurrentX) {
+        this.ctx.$setCurrentX(0);
+      }
+      this.current.x = this.current.lineX = 0;
+      this.current.y = this.current.lineY = 0;
+    },
+    nextLine: function canvasGraphicsNextLine() {
+      this.moveText(0, this.current.leading);
+    },
+    showText: function canvasGraphicsShowText(text) {
+      var ctx = this.ctx;
+      var current = this.current;
+      var font = current.font;
+      var glyphs = font.charsToGlyphs(text);
+      var fontSize = current.fontSize;
+      var charSpacing = current.charSpacing;
+      var wordSpacing = current.wordSpacing;
+      var textHScale = current.textHScale;
+      var glyphsLength = glyphs.length;
+      if (font.coded) {
+        ctx.save();
+        ctx.transform.apply(ctx, current.textMatrix);
+        ctx.translate(current.x, current.y);
+
+        var fontMatrix = font.fontMatrix || IDENTITY_MATRIX;
+        ctx.scale(1 / textHScale, 1);
+        for (var i = 0; i < glyphsLength; ++i) {
+
+          var glyph = glyphs[i];
+          if (glyph === null) {
+            // word break
+            this.ctx.translate(wordSpacing, 0);
+            continue;
+          }
+
+          this.save();
+          ctx.scale(fontSize, fontSize);
+          ctx.transform.apply(ctx, fontMatrix);
+          this.execute(glyph.code, this.xref, font.resources);
+          this.restore();
+
+          var transformed = Util.applyTransform([glyph.width, 0], fontMatrix);
+          var width = transformed[0] * fontSize + charSpacing;
+
+          ctx.translate(width, 0);
+          current.x += width;
+
+        }
+        ctx.restore();
+      } else {
+        ctx.save();
+        ctx.transform.apply(ctx, current.textMatrix);
+        ctx.scale(1, -1);
+        ctx.translate(current.x, -1 * current.y);
+        ctx.transform.apply(ctx, font.fontMatrix || IDENTITY_MATRIX);
+
+        ctx.scale(1 / textHScale, 1);
+
+        var width = 0;
+        for (var i = 0; i < glyphsLength; ++i) {
+          var glyph = glyphs[i];
+          if (glyph === null) {
+            // word break
+            width += wordSpacing;
+            continue;
+          }
+
+          var unicode = glyph.unicode;
+          var char = (unicode >= 0x10000) ?
+            String.fromCharCode(0xD800 | ((unicode - 0x10000) >> 10),
+            0xDC00 | (unicode & 0x3FF)) : String.fromCharCode(unicode);
+
+          ctx.fillText(char, width, 0);
+          width += glyph.width * fontSize * 0.001 + charSpacing;
+        }
+        current.x += width;
+
+        ctx.restore();
+      }
+    },
+    showSpacedText: function canvasGraphicsShowSpacedText(arr) {
+      var ctx = this.ctx;
+      var current = this.current;
+      var fontSize = current.fontSize;
+      var textHScale = current.textHScale;
+      var arrLength = arr.length;
+      for (var i = 0; i < arrLength; ++i) {
+        var e = arr[i];
+        if (isNum(e)) {
+          if (ctx.$addCurrentX) {
+            ctx.$addCurrentX(-e * 0.001 * fontSize);
+          } else {
+            current.x -= e * 0.001 * fontSize * textHScale;
+          }
+        } else if (isString(e)) {
+          this.showText(e);
+        } else {
+          malformed('TJ array element ' + e + ' is not string or num');
+        }
+      }
+    },
+    nextLineShowText: function canvasGraphicsNextLineShowText(text) {
+      this.nextLine();
+      this.showText(text);
+    },
+    nextLineSetSpacingShowText:
+      function canvasGraphicsNextLineSetSpacingShowText(wordSpacing,
+                                                        charSpacing,
+                                                        text) {
+      this.setWordSpacing(wordSpacing);
+      this.setCharSpacing(charSpacing);
+      this.nextLineShowText(text);
+    },
+
+    // Type3 fonts
+    setCharWidth: function canvasGraphicsSetCharWidth(xWidth, yWidth) {
+      // We can safely ignore this since the width should be the same
+      // as the width in the Widths array.
+    },
+    setCharWidthAndBounds: function canvasGraphicsSetCharWidthAndBounds(xWidth,
+                                                                        yWidth,
+                                                                        llx,
+                                                                        lly,
+                                                                        urx,
+                                                                        ury) {
+      // TODO According to the spec we're also suppose to ignore any operators
+      // that set color or include images while processing this type3 font.
+      this.rectangle(llx, lly, urx - llx, ury - lly);
+      this.clip();
+      this.endPath();
+    },
+
+    // Color
+    setStrokeColorSpace: function canvasGraphicsSetStrokeColorSpace(space) {
+      this.current.strokeColorSpace =
+          ColorSpace.parse(space, this.xref, this.res);
+    },
+    setFillColorSpace: function canvasGraphicsSetFillColorSpace(space) {
+      this.current.fillColorSpace =
+          ColorSpace.parse(space, this.xref, this.res);
+    },
+    setStrokeColor: function canvasGraphicsSetStrokeColor(/*...*/) {
+      var cs = this.current.strokeColorSpace;
+      var color = cs.getRgb(arguments);
+      this.setStrokeRGBColor.apply(this, color);
+    },
+    setStrokeColorN: function canvasGraphicsSetStrokeColorN(/*...*/) {
+      var cs = this.current.strokeColorSpace;
+
+      if (cs.name == 'Pattern') {
+        // wait until fill to actually get the pattern, since Canvas
+        // calcualtes the pattern according to the current coordinate space,
+        // not the space when the pattern is set.
+        var pattern = Pattern.parse(arguments, cs, this.xref, this.res,
+                                    this.ctx);
+        this.current.strokeColor = pattern;
+      } else {
+        this.setStrokeColor.apply(this, arguments);
+      }
+    },
+    setFillColor: function canvasGraphicsSetFillColor(/*...*/) {
+      var cs = this.current.fillColorSpace;
+      var color = cs.getRgb(arguments);
+      this.setFillRGBColor.apply(this, color);
+    },
+    setFillColorN: function canvasGraphicsSetFillColorN(/*...*/) {
+      var cs = this.current.fillColorSpace;
+
+      if (cs.name == 'Pattern') {
+        // wait until fill to actually get the pattern
+        var pattern = Pattern.parse(arguments, cs, this.xref, this.res,
+                                    this.ctx);
+        this.current.fillColor = pattern;
+      } else {
+        this.setFillColor.apply(this, arguments);
+      }
+    },
+    setStrokeGray: function canvasGraphicsSetStrokeGray(gray) {
+      this.setStrokeRGBColor(gray, gray, gray);
+    },
+    setFillGray: function canvasGraphicsSetFillGray(gray) {
+      this.setFillRGBColor(gray, gray, gray);
+    },
+    setStrokeRGBColor: function canvasGraphicsSetStrokeRGBColor(r, g, b) {
+      var color = Util.makeCssRgb(r, g, b);
+      this.ctx.strokeStyle = color;
+      this.current.strokeColor = color;
+    },
+    setFillRGBColor: function canvasGraphicsSetFillRGBColor(r, g, b) {
+      var color = Util.makeCssRgb(r, g, b);
+      this.ctx.fillStyle = color;
+      this.current.fillColor = color;
+    },
+    setStrokeCMYKColor: function canvasGraphicsSetStrokeCMYKColor(c, m, y, k) {
+      var color = Util.makeCssCmyk(c, m, y, k);
+      this.ctx.strokeStyle = color;
+      this.current.strokeColor = color;
+    },
+    setFillCMYKColor: function canvasGraphicsSetFillCMYKColor(c, m, y, k) {
+      var color = Util.makeCssCmyk(c, m, y, k);
+      this.ctx.fillStyle = color;
+      this.current.fillColor = color;
+    },
+
+    // Shading
+    shadingFill: function canvasGraphicsShadingFill(shadingName) {
+      var xref = this.xref;
+      var res = this.res;
+      var ctx = this.ctx;
+
+      var shadingRes = xref.fetchIfRef(res.get('Shading'));
+      if (!shadingRes)
+        error('No shading resource found');
+
+      var shading = xref.fetchIfRef(shadingRes.get(shadingName.name));
+      if (!shading)
+        error('No shading object found');
+
+      var shadingFill = Pattern.parseShading(shading, null, xref, res, ctx);
+
+      this.save();
+      ctx.fillStyle = shadingFill.getPattern();
+
+      var inv = ctx.mozCurrentTransformInverse;
+      if (inv) {
+        var canvas = ctx.canvas;
+        var width = canvas.width;
+        var height = canvas.height;
+
+        var bl = Util.applyTransform([0, 0], inv);
+        var br = Util.applyTransform([0, width], inv);
+        var ul = Util.applyTransform([height, 0], inv);
+        var ur = Util.applyTransform([height, width], inv);
+
+        var x0 = Math.min(bl[0], br[0], ul[0], ur[0]);
+        var y0 = Math.min(bl[1], br[1], ul[1], ur[1]);
+        var x1 = Math.max(bl[0], br[0], ul[0], ur[0]);
+        var y1 = Math.max(bl[1], br[1], ul[1], ur[1]);
+
+        this.ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+      } else {
+        // HACK to draw the gradient onto an infinite rectangle.
+        // PDF gradients are drawn across the entire image while
+        // Canvas only allows gradients to be drawn in a rectangle
+        // The following bug should allow us to remove this.
+        // https://bugzilla.mozilla.org/show_bug.cgi?id=664884
+
+        this.ctx.fillRect(-1e10, -1e10, 2e10, 2e10);
+      }
+
+      this.restore();
+    },
+
+    // Images
+    beginInlineImage: function canvasGraphicsBeginInlineImage() {
+      error('Should not call beginInlineImage');
+    },
+    beginImageData: function canvasGraphicsBeginImageData() {
+      error('Should not call beginImageData');
+    },
+    endInlineImage: function canvasGraphicsEndInlineImage(image) {
+      this.paintImageXObject(null, image, true);
+    },
+
+    // XObjects
+    paintXObject: function canvasGraphicsPaintXObject(obj) {
+      var xobj = this.xobjs.get(obj.name);
+      if (!xobj)
+        return;
+      xobj = this.xref.fetchIfRef(xobj);
+      assertWellFormed(isStream(xobj), 'XObject should be a stream');
+
+      var oc = xobj.dict.get('OC');
+      if (oc) {
+        TODO('oc for xobject');
+      }
+
+      var opi = xobj.dict.get('OPI');
+      if (opi) {
+        TODO('opi for xobject');
+      }
+
+      var type = xobj.dict.get('Subtype');
+      assertWellFormed(isName(type), 'XObject should have a Name subtype');
+      if ('Image' == type.name) {
+        this.paintImageXObject(obj, xobj, false);
+      } else if ('Form' == type.name) {
+        this.paintFormXObject(obj, xobj);
+      } else if ('PS' == type.name) {
+        warn('(deprecated) PostScript XObjects are not supported');
+      } else {
+        malformed('Unknown XObject subtype ' + type.name);
+      }
+    },
+
+    paintFormXObject: function canvasGraphicsPaintFormXObject(ref, stream) {
+      this.save();
+
+      var matrix = stream.dict.get('Matrix');
+      if (matrix && isArray(matrix) && 6 == matrix.length)
+        this.transform.apply(this, matrix);
+
+      var bbox = stream.dict.get('BBox');
+      if (bbox && isArray(bbox) && 4 == bbox.length) {
+        this.rectangle.apply(this, bbox);
+        this.clip();
+        this.endPath();
+      }
+
+      this.execute(ref.code, this.xref, stream.dict.get('Resources'));
+
+      this.restore();
+    },
+
+    paintImageXObject: function canvasGraphicsPaintImageXObject(ref, image,
+                                                                inline) {
+      this.save();
+
+      var ctx = this.ctx;
+      var dict = image.dict;
+      var w = dict.get('Width', 'W');
+      var h = dict.get('Height', 'H');
+      // scale the image to the unit square
+      ctx.scale(1 / w, -1 / h);
+
+      // If the platform can render the image format directly, the
+      // stream has a getImage property which directly returns a
+      // suitable DOM Image object.
+      if (image.getImage) {
+        var domImage = image.getImage();
+        ctx.drawImage(domImage, 0, 0, domImage.width, domImage.height,
+                      0, -h, w, h);
+        this.restore();
+        return;
+      }
+
+      var imageObj = new PDFImage(this.xref, this.res, image, inline);
+
+      var tmpCanvas = new this.ScratchCanvas(w, h);
+      var tmpCtx = tmpCanvas.getContext('2d');
+      if (imageObj.imageMask) {
+        var fillColor = this.current.fillColor;
+        tmpCtx.fillStyle = (fillColor && fillColor.type === 'Pattern') ?
+          fillColor.getPattern(tmpCtx) : fillColor;
+        tmpCtx.fillRect(0, 0, w, h);
+      }
+      var imgData = tmpCtx.getImageData(0, 0, w, h);
+      var pixels = imgData.data;
+
+      if (imageObj.imageMask) {
+        var inverseDecode = !!imageObj.decode && imageObj.decode[0] > 0;
+        imageObj.applyStencilMask(pixels, inverseDecode);
+      } else
+        imageObj.fillRgbaBuffer(pixels, imageObj.decode);
+
+      tmpCtx.putImageData(imgData, 0, 0);
+      ctx.drawImage(tmpCanvas, 0, -h);
+      this.restore();
+    },
+
+    // Marked content
+
+    markPoint: function canvasGraphicsMarkPoint(tag) {
+      TODO('Marked content');
+    },
+    markPointProps: function canvasGraphicsMarkPointProps(tag, properties) {
+      TODO('Marked content');
+    },
+    beginMarkedContent: function canvasGraphicsBeginMarkedContent(tag) {
+      TODO('Marked content');
+    },
+    beginMarkedContentProps:
+      function canvasGraphicsBeginMarkedContentProps(tag, properties) {
+      TODO('Marked content');
+    },
+    endMarkedContent: function canvasGraphicsEndMarkedContent() {
+      TODO('Marked content');
+    },
+
+    // Compatibility
+
+    beginCompat: function canvasGraphicsBeginCompat() {
+      TODO('ignore undefined operators (should we do that anyway?)');
+    },
+    endCompat: function canvasGraphicsEndCompat() {
+      TODO('stop ignoring undefined operators');
+    },
+
+    // Helper functions
+
+    consumePath: function canvasGraphicsConsumePath() {
+      if (this.pendingClip) {
+        var savedFillRule = null;
+        if (this.pendingClip == EO_CLIP)
+          savedFillRule = this.setEOFillRule();
+
+        this.ctx.clip();
+
+        this.pendingClip = null;
+        if (savedFillRule !== null)
+          this.restoreFillRule(savedFillRule);
+      }
+      this.ctx.beginPath();
+    },
+    // We generally keep the canvas context set for
+    // nonzero-winding, and just set evenodd for the operations
+    // that need them.
+    setEOFillRule: function canvasGraphicsSetEOFillRule() {
+      var savedFillRule = this.ctx.mozFillRule;
+      this.ctx.mozFillRule = 'evenodd';
+      return savedFillRule;
+    },
+    restoreFillRule: function canvasGraphicsRestoreFillRule(rule) {
+      this.ctx.mozFillRule = rule;
+    }
+  };
+
+  return constructor;
+})();
+
 var Util = (function utilUtil() {
   function constructor() {}
   constructor.makeCssRgb = function makergb(r, g, b) {
@@ -5402,56 +5756,6 @@ var ColorSpace = (function colorSpaceColorSpace() {
   };
 
   constructor.parse = function colorspace_parse(cs, xref, res) {
-    var IR = constructor.parseToIR(cs, xref, res, true);
-    if (!(IR instanceof SeparationCS)) {
-      return constructor.unserialize(IR);
-    } else {
-      return IR;
-    }
-  };
-
-  constructor.unserialize = function(IR) {
-    var name;
-    if (isArray(IR)) {
-      name = IR[0];
-    } else {
-      name = IR;
-    }
-
-    switch (name) {
-      case 'DeviceGrayCS':
-        return new DeviceGrayCS();
-      case 'DeviceRgbCS':
-        return new DeviceRgbCS();
-      case 'DeviceCmykCS':
-        return new DeviceCmykCS();
-      case 'PatternCS':
-        var baseCS = IR[1];
-        if (baseCS == null) {
-          return new PatternCS(null);
-        } else {
-          return new PatternCS(ColorSpace.unserialize(baseCS));
-        }
-      case 'IndexedCS':
-        var baseCS = IR[1];
-        var hiVal = IR[2];
-        var lookup = IR[3];
-        return new IndexedCS(ColorSpace.unserialize(baseCS), hiVal, lookup);
-      case 'SeparationCS':
-        var alt = IR[1];
-        var tintFnIR = IR[2];
-
-        return new SeparationCS(
-          ColorSpace.unserialize(alt),
-          PDFFunction.unserialize(tintFnIR)
-        );
-      default:
-        error('Unkown name ' + name);
-    }
-    return null;
-  }
-
-  constructor.parseToIR = function colorspace_parse(cs, xref, res, parseOnly) {
     if (isName(cs)) {
       var colorSpaces = xref.fetchIfRef(res.get('ColorSpace'));
       if (isDict(colorSpaces)) {
@@ -5468,67 +5772,67 @@ var ColorSpace = (function colorSpaceColorSpace() {
       this.mode = mode;
 
       switch (mode) {
-      case 'DeviceGray':
-      case 'G':
-        return 'DeviceGrayCS';
-      case 'DeviceRGB':
-      case 'RGB':
-        return 'DeviceRgbCS';
-      case 'DeviceCMYK':
-      case 'CMYK':
-        return 'DeviceCmykCS';
-      case 'Pattern':
-        return ['PatternCS', null];
-      default:
-        error('unrecognized colorspace ' + mode);
+        case 'DeviceGray':
+        case 'G':
+          return new DeviceGrayCS();
+        case 'DeviceRGB':
+        case 'RGB':
+          return new DeviceRgbCS();
+        case 'DeviceCMYK':
+        case 'CMYK':
+          return new DeviceCmykCS();
+        case 'Pattern':
+          return new PatternCS(null);
+        default:
+          error('unrecognized colorspace ' + mode);
       }
     } else if (isArray(cs)) {
       var mode = cs[0].name;
       this.mode = mode;
 
       switch (mode) {
-      case 'DeviceGray':
-      case 'G':
-        return 'DeviceGrayCS';
-      case 'DeviceRGB':
-      case 'RGB':
-        return 'DeviceRgbCS';
-      case 'DeviceCMYK':
-      case 'CMYK':
-        return 'DeviceCmykCS';
-      case 'CalGray':
-        return 'DeviceGrayCS';
-      case 'CalRGB':
-        return 'DeviceRgbCS';
-      case 'ICCBased':
-        var stream = xref.fetchIfRef(cs[1]);
-        var dict = stream.dict;
-        var numComps = dict.get('N');
-        if (numComps == 1)
-          return 'DeviceGrayCS';
-        if (numComps == 3)
-          return 'DeviceRgbCS';
-        if (numComps == 4)
-          return 'DeviceCmykCS';
-        break;
-      case 'Pattern':
-        var baseCS = cs[1];
-        if (baseCS)
-          baseCS = ColorSpace.parseToIR(baseCS, xref, res);
-        return ['PatternCS', baseCS];
-      case 'Indexed':
-        var baseCS = ColorSpace.parseToIR(cs[1], xref, res);
-        var hiVal = cs[2] + 1;
-        var lookup = xref.fetchIfRef(cs[3]);
-        return ['IndexedCS', baseCS, hiVal, lookup];
-      case 'Separation':
-        var alt = ColorSpace.parseToIR(cs[2], xref, res);
-        var tintFnIR = PDFFunction.serialize(xref, xref.fetchIfRef(cs[3]));
-        return ['SeparationCS', alt, tintFnIR];
-      case 'Lab':
-      case 'DeviceN':
-      default:
-        error('unimplemented color space object "' + mode + '"');
+        case 'DeviceGray':
+        case 'G':
+          return new DeviceGrayCS();
+        case 'DeviceRGB':
+        case 'RGB':
+          return new DeviceRgbCS();
+        case 'DeviceCMYK':
+        case 'CMYK':
+          return new DeviceCmykCS();
+        case 'CalGray':
+          return new DeviceGrayCS();
+        case 'CalRGB':
+          return new DeviceRgbCS();
+        case 'ICCBased':
+          var stream = xref.fetchIfRef(cs[1]);
+          var dict = stream.dict;
+          var numComps = dict.get('N');
+          if (numComps == 1)
+            return new DeviceGrayCS();
+          if (numComps == 3)
+            return new DeviceRgbCS();
+          if (numComps == 4)
+            return new DeviceCmykCS();
+          break;
+        case 'Pattern':
+          var baseCS = cs[1];
+          if (baseCS)
+            baseCS = ColorSpace.parse(baseCS, xref, res);
+          return new PatternCS(baseCS);
+        case 'Indexed':
+          var base = ColorSpace.parse(cs[1], xref, res);
+          var hiVal = cs[2] + 1;
+          var lookup = xref.fetchIfRef(cs[3]);
+          return new IndexedCS(base, hiVal, lookup);
+        case 'Separation':
+          var alt = ColorSpace.parse(cs[2], xref, res);
+          var tintFn = new PDFFunction(xref, xref.fetchIfRef(cs[3]));
+          return new SeparationCS(alt, tintFn);
+        case 'Lab':
+        case 'DeviceN':
+        default:
+          error('unimplemented color space object "' + mode + '"');
       }
     } else {
       error('unrecognized color space object: "' + cs + '"');
@@ -5551,7 +5855,7 @@ var SeparationCS = (function separationCS() {
 
   constructor.prototype = {
     getRgb: function sepcs_getRgb(color) {
-      var tinted = this.tintFn(color);
+      var tinted = this.tintFn.func(color);
       return this.base.getRgb(tinted);
     },
     getRgbBuffer: function sepcs_getRgbBuffer(input, bits) {
@@ -5566,11 +5870,12 @@ var SeparationCS = (function separationCS() {
       var baseBuf = new Uint8Array(numComps * length);
       for (var i = 0; i < length; ++i) {
         var scaled = input[i] * scale;
-        var tinted = tintFn([scaled]);
+        var tinted = tintFn.func([scaled]);
         for (var j = 0; j < numComps; ++j)
           baseBuf[pos++] = 255 * tinted[j];
       }
       return base.getRgbBuffer(baseBuf, 8);
+
     }
   };
 
@@ -5794,6 +6099,46 @@ var Pattern = (function patternPattern() {
     }
   };
 
+  constructor.parse = function pattern_parse(args, cs, xref, res, ctx) {
+    var length = args.length;
+
+    var patternName = args[length - 1];
+    if (!isName(patternName))
+      error('Bad args to getPattern: ' + patternName);
+
+    var patternRes = xref.fetchIfRef(res.get('Pattern'));
+    if (!patternRes)
+      error('Unable to find pattern resource');
+
+    var pattern = xref.fetchIfRef(patternRes.get(patternName.name));
+    var dict = isStream(pattern) ? pattern.dict : pattern;
+    var typeNum = dict.get('PatternType');
+
+    switch (typeNum) {
+      case 1:
+        var base = cs.base;
+        var color;
+        if (base) {
+          var baseComps = base.numComps;
+
+          color = [];
+          for (var i = 0; i < baseComps; ++i)
+            color.push(args[i]);
+
+          color = base.getRgb(color);
+        }
+        var code = patternName.code;
+        return new TilingPattern(pattern, code, dict, color, xref, ctx);
+      case 2:
+        var shading = xref.fetchIfRef(dict.get('Shading'));
+        var matrix = dict.get('Matrix');
+        return Pattern.parseShading(shading, matrix, xref, res, ctx);
+      default:
+        error('Unknown type of pattern: ' + typeNum);
+    }
+    return null;
+  };
+
   constructor.parseShading = function pattern_shading(shading, matrix,
       xref, res, ctx) {
 
@@ -5816,14 +6161,9 @@ var DummyShading = (function dummyShading() {
   function constructor() {
     this.type = 'Pattern';
   }
-
-  constructor.unserialize = function() {
-    return 'hotpink';
-  }
-
   constructor.prototype = {
-    serialize: function dummpy_getir() {
-      return ['DummyShading'];
+    getPattern: function dummy_getpattern() {
+      return 'hotpink';
     }
   };
   return constructor;
@@ -5839,6 +6179,8 @@ var RadialAxialShading = (function radialAxialShading() {
     this.type = 'Pattern';
 
     this.ctx = ctx;
+    this.curMatrix = ctx.mozCurrentTransform;
+
     var cs = dict.get('ColorSpace', 'CS');
     cs = ColorSpace.parse(cs, xref, res);
     this.cs = cs;
@@ -5867,7 +6209,7 @@ var RadialAxialShading = (function radialAxialShading() {
       error('No support for array of functions');
     else if (!isPDFFunction(fnObj))
       error('Invalid function');
-    var fn = PDFFunction.parse(xref, fnObj);
+    var fn = new PDFFunction(xref, fnObj);
 
     // 10 samples seems good enough for now, but probably won't work
     // if there are sharp color changes. Ideally, we would implement
@@ -5877,7 +6219,7 @@ var RadialAxialShading = (function radialAxialShading() {
 
     var colorStops = [];
     for (var i = t0; i <= t1; i += step) {
-      var color = fn([i]);
+      var color = fn.func([i]);
       var rgbColor = Util.makeCssRgb.apply(this, cs.getRgb(color));
       colorStops.push([(i - t0) / diff, rgbColor]);
     }
@@ -5886,19 +6228,18 @@ var RadialAxialShading = (function radialAxialShading() {
   }
 
   constructor.prototype = {
-    serialize: function RadialAxialShading_serialize() {
+    getPattern: function radialAxialShadingGetPattern() {
       var coordsArr = this.coordsArr;
       var type = this.shadingType;
+      var p0, p1, r0, r1;
       if (type == 2) {
-        var p0 = [coordsArr[0], coordsArr[1]];
-        var p1 = [coordsArr[2], coordsArr[3]];
-        var r0 = null;
-        var r1 = null;
+        p0 = [coordsArr[0], coordsArr[1]];
+        p1 = [coordsArr[2], coordsArr[3]];
       } else if (type == 3) {
-        var p0 = [coordsArr[0], coordsArr[1]];
-        var p1 = [coordsArr[3], coordsArr[4]];
-        var r0 = coordsArr[2];
-        var r1 = coordsArr[5];
+        p0 = [coordsArr[0], coordsArr[1]];
+        p1 = [coordsArr[3], coordsArr[4]];
+        r0 = coordsArr[2];
+        r1 = coordsArr[5];
       } else {
         error('getPattern type unknown: ' + type);
       }
@@ -5909,26 +6250,143 @@ var RadialAxialShading = (function radialAxialShading() {
         p1 = Util.applyTransform(p1, matrix);
       }
 
-      return ['RadialAxialShading', type, this.colorStops, p0, p1, r0, r1];
+      // if the browser supports getting the tranform matrix, convert
+      // gradient coordinates from pattern space to current user space
+      var curMatrix = this.curMatrix;
+      var ctx = this.ctx;
+      if (curMatrix) {
+        var userMatrix = ctx.mozCurrentTransformInverse;
+
+        p0 = Util.applyTransform(p0, curMatrix);
+        p0 = Util.applyTransform(p0, userMatrix);
+
+        p1 = Util.applyTransform(p1, curMatrix);
+        p1 = Util.applyTransform(p1, userMatrix);
+      }
+
+      var colorStops = this.colorStops, grad;
+      if (type == 2)
+        grad = ctx.createLinearGradient(p0[0], p0[1], p1[0], p1[1]);
+      else if (type == 3)
+        grad = ctx.createRadialGradient(p0[0], p0[1], r0, p1[0], p1[1], r1);
+
+      for (var i = 0, ii = colorStops.length; i < ii; ++i) {
+        var c = colorStops[i];
+        grad.addColorStop(c[0], c[1]);
+      }
+      return grad;
     }
   };
-
   return constructor;
 })();
 
-var TilingPattern = {
-  serialize: function(codeIR, dict, args) {
-    var matrix = dict.get('Matrix');
-    var bbox = dict.get('BBox');
-    var xstep = dict.get('XStep');
-    var ystep = dict.get('YStep');
-    var paintType = dict.get('PaintType');
+var TilingPattern = (function tilingPattern() {
+  var PAINT_TYPE_COLORED = 1, PAINT_TYPE_UNCOLORED = 2;
 
-    return [
-      'TilingPatternIR', args, codeIR, matrix, bbox, xstep, ystep, paintType
-    ];
+  function constructor(pattern, code, dict, color, xref, ctx) {
+      function multiply(m, tm) {
+        var a = m[0] * tm[0] + m[1] * tm[2];
+        var b = m[0] * tm[1] + m[1] * tm[3];
+        var c = m[2] * tm[0] + m[3] * tm[2];
+        var d = m[2] * tm[1] + m[3] * tm[3];
+        var e = m[4] * tm[0] + m[5] * tm[2] + tm[4];
+        var f = m[4] * tm[1] + m[5] * tm[3] + tm[5];
+        return [a, b, c, d, e, f];
+      }
+
+      TODO('TilingType');
+
+      this.matrix = dict.get('Matrix');
+      this.curMatrix = ctx.mozCurrentTransform;
+      this.invMatrix = ctx.mozCurrentTransformInverse;
+      this.ctx = ctx;
+      this.type = 'Pattern';
+
+      var bbox = dict.get('BBox');
+      var x0 = bbox[0], y0 = bbox[1], x1 = bbox[2], y1 = bbox[3];
+
+      var xstep = dict.get('XStep');
+      var ystep = dict.get('YStep');
+
+      var topLeft = [x0, y0];
+      // we want the canvas to be as large as the step size
+      var botRight = [x0 + xstep, y0 + ystep];
+
+      var width = botRight[0] - topLeft[0];
+      var height = botRight[1] - topLeft[1];
+
+      // TODO: hack to avoid OOM, we would idealy compute the tiling
+      // pattern to be only as large as the acual size in device space
+      // This could be computed with .mozCurrentTransform, but still
+      // needs to be implemented
+      while (Math.abs(width) > 512 || Math.abs(height) > 512) {
+        width = 512;
+        height = 512;
+      }
+
+      var tmpCanvas = new ScratchCanvas(width, height);
+
+      // set the new canvas element context as the graphics context
+      var tmpCtx = tmpCanvas.getContext('2d');
+      var graphics = new CanvasGraphics(tmpCtx);
+
+      var paintType = dict.get('PaintType');
+      switch (paintType) {
+        case PAINT_TYPE_COLORED:
+          tmpCtx.fillStyle = ctx.fillStyle;
+          tmpCtx.strokeStyle = ctx.strokeStyle;
+          break;
+        case PAINT_TYPE_UNCOLORED:
+          color = Util.makeCssRgb.apply(this, color);
+          tmpCtx.fillStyle = color;
+          tmpCtx.strokeStyle = color;
+          break;
+        default:
+          error('Unsupported paint type: ' + paintType);
+      }
+
+      var scale = [width / xstep, height / ystep];
+      this.scale = scale;
+
+      // transform coordinates to pattern space
+      var tmpTranslate = [1, 0, 0, 1, -topLeft[0], -topLeft[1]];
+      var tmpScale = [scale[0], 0, 0, scale[1], 0, 0];
+      graphics.transform.apply(graphics, tmpScale);
+      graphics.transform.apply(graphics, tmpTranslate);
+
+      if (bbox && isArray(bbox) && 4 == bbox.length) {
+        graphics.rectangle.apply(graphics, bbox);
+        graphics.clip();
+        graphics.endPath();
+      }
+
+      var res = xref.fetchIfRef(dict.get('Resources'));
+      graphics.execute(code, xref, res);
+
+      this.canvas = tmpCanvas;
   }
-};
+
+  constructor.prototype = {
+    getPattern: function tiling_getPattern() {
+      var matrix = this.matrix;
+      var curMatrix = this.curMatrix;
+      var ctx = this.ctx;
+
+      if (curMatrix)
+        ctx.setTransform.apply(ctx, curMatrix);
+
+      if (matrix)
+        ctx.transform.apply(ctx, matrix);
+
+      var scale = this.scale;
+      ctx.scale(1 / scale[0], 1 / scale[1]);
+
+      return ctx.createPattern(this.canvas, 'repeat');
+    }
+  };
+  return constructor;
+})();
+
 
 var PDFImage = (function pdfImage() {
   function constructor(xref, res, image, inline) {
@@ -6057,18 +6515,6 @@ var PDFImage = (function pdfImage() {
       var buf = new Uint8Array(width * height);
 
       if (smask) {
-        if (smask.image.getImage) {
-          // smask is a DOM image
-          var tempCanvas = new ScratchCanvas(width, height);
-          var tempCtx = tempCanvas.getContext('2d');
-          var domImage = smask.image.getImage();
-          tempCtx.drawImage(domImage, 0, 0, domImage.width, domImage.height,
-            0, 0, width, height);
-          var data = tempCtx.getImageData(0, 0, width, height).data;
-          for (var i = 0, j = 0, ii = width * height; i < ii; ++i, j += 4)
-            buf[i] = data[j]; // getting first component value
-          return buf;
-        }
         var sw = smask.width;
         var sh = smask.height;
         if (sw != this.width || sh != this.height)
@@ -6156,78 +6602,28 @@ var PDFImage = (function pdfImage() {
   return constructor;
 })();
 
-var PDFFunction = (function() {
-  var CONSTRUCT_SAMPLED = 0;
-  var CONSTRUCT_INTERPOLATED = 2;
-  var CONSTRUCT_STICHED = 3;
-  var CONSTRUCT_POSTSCRIPT = 4;
+var PDFFunction = (function pdfFunction() {
+  function constructor(xref, fn) {
+    var dict = fn.dict;
+    if (!dict)
+      dict = fn;
 
-  return {
-    getSampleArray: function(size, outputSize, bps, str) {
-      var length = 1;
-      for (var i = 0; i < size.length; i++)
-        length *= size[i];
-      length *= outputSize;
+    var types = [this.constructSampled,
+                 null,
+                 this.constructInterpolated,
+                 this.constructStiched,
+                 this.constructPostScript];
 
-      var array = [];
-      var codeSize = 0;
-      var codeBuf = 0;
+    var typeNum = dict.get('FunctionType');
+    var typeFn = types[typeNum];
+    if (!typeFn)
+      error('Unknown type of function');
 
-      var strBytes = str.getBytes((length * bps + 7) / 8);
-      var strIdx = 0;
-      for (var i = 0; i < length; i++) {
-        var b;
-        while (codeSize < bps) {
-          codeBuf <<= 8;
-          codeBuf |= strBytes[strIdx++];
-          codeSize += 8;
-        }
-        codeSize -= bps;
-        array.push(codeBuf >> codeSize);
-        codeBuf &= (1 << codeSize) - 1;
-      }
-      return array;
-    },
+    typeFn.call(this, fn, dict, xref);
+  }
 
-    serialize: function(xref, fn) {
-      var dict = fn.dict;
-      if (!dict)
-        dict = fn;
-
-      var types = [this.constructSampled,
-                   null,
-                   this.constructInterpolated,
-                   this.constructStiched,
-                   this.constructPostScript];
-
-      var typeNum = dict.get('FunctionType');
-      var typeFn = types[typeNum];
-      if (!typeFn)
-        error('Unknown type of function');
-
-      return typeFn.call(this, fn, dict, xref);
-    },
-
-    unserialize: function(IR) {
-      var type = IR[0];
-      switch (type) {
-        case CONSTRUCT_SAMPLED:
-          return this.constructSampledFromIR(IR);
-        case CONSTRUCT_INTERPOLATED:
-          return this.constructInterpolatedFromIR(IR);
-        case CONSTRUCT_STICHED:
-          return this.constructStichedFromIR(IR);
-        case CONSTRUCT_POSTSCRIPT:
-          return this.constructPostScriptFromIR(IR);
-      }
-    },
-
-    parse: function(xref, fn) {
-      var IR = this.serialize(xref, fn);
-      return this.unserialize(IR);
-    },
-
-    constructSampled: function(str, dict) {
+  constructor.prototype = {
+    constructSampled: function pdfFunctionConstructSampled(str, dict) {
       var domain = dict.get('Domain');
       var range = dict.get('Range');
 
@@ -6263,25 +6659,8 @@ var PDFFunction = (function() {
 
       var samples = this.getSampleArray(size, outputSize, bps, str);
 
-      return [
-        CONSTRUCT_SAMPLED, inputSize, domain, encode, decode, samples, size,
-        outputSize, bps, range
-      ];
-    },
-
-    constructSampledFromIR: function(IR) {
-      var inputSize = IR[1];
-      var domain = IR[2];
-      var encode = IR[3];
-      var decode = IR[4];
-      var samples = IR[5];
-      var size = IR[6];
-      var outputSize = IR[7];
-      var bps = IR[8];
-      var range = IR[9];
-
-      return function(args) {
-        var clip = function(v, min, max) {
+      this.func = function pdfFunctionFunc(args) {
+        var clip = function pdfFunctionClip(v, min, max) {
           if (v > max)
             v = max;
           else if (v < min)
@@ -6337,11 +6716,36 @@ var PDFFunction = (function() {
         }
 
         return output;
-      }
+      };
     },
+    getSampleArray: function pdfFunctionGetSampleArray(size, outputSize, bps,
+                                                       str) {
+      var length = 1;
+      for (var i = 0; i < size.length; i++)
+        length *= size[i];
+      length *= outputSize;
 
-    constructInterpolated:
-    function pdfFunctionConstructInterpolated(str, dict) {
+      var array = [];
+      var codeSize = 0;
+      var codeBuf = 0;
+
+      var strBytes = str.getBytes((length * bps + 7) / 8);
+      var strIdx = 0;
+      for (var i = 0; i < length; i++) {
+        var b;
+        while (codeSize < bps) {
+          codeBuf <<= 8;
+          codeBuf |= strBytes[strIdx++];
+          codeSize += 8;
+        }
+        codeSize -= bps;
+        array.push(codeBuf >> codeSize);
+        codeBuf &= (1 << codeSize) - 1;
+      }
+      return array;
+    },
+    constructInterpolated: function pdfFunctionConstructInterpolated(str,
+                                                                     dict) {
       var c0 = dict.get('C0') || [0];
       var c1 = dict.get('C1') || [1];
       var n = dict.get('N');
@@ -6354,29 +6758,16 @@ var PDFFunction = (function() {
       for (var i = 0; i < length; ++i)
         diff.push(c1[i] - c0[i]);
 
-      return [CONSTRUCT_INTERPOLATED, c0, diff, n];
-    },
-
-    constructInterpolatedFromIR:
-    function pdfFunctionconstructInterpolatedFromIR(IR) {
-      var c0 = IR[1];
-      var diff = IR[2];
-      var n = IR[3];
-
-      var length = diff.length;
-
-      return function(args) {
-        var x = n == 1 ? args[0] : Math.pow(args[0], n);
+      this.func = function pdfFunctionConstructInterpolatedFunc(args) {
+        var x = args[0];
 
         var out = [];
         for (var j = 0; j < length; ++j)
-          out.push(c0[j] + (x * diff[j]));
+          out.push(c0[j] + (x^n * diff[i]));
 
         return out;
-
-      }
+      };
     },
-
     constructStiched: function pdfFunctionConstructStiched(fn, dict, xref) {
       var domain = dict.get('Domain');
       var range = dict.get('Range');
@@ -6391,27 +6782,13 @@ var PDFFunction = (function() {
       var fnRefs = dict.get('Functions');
       var fns = [];
       for (var i = 0, ii = fnRefs.length; i < ii; ++i)
-        fns.push(PDFFunction.serialize(xref, xref.fetchIfRef(fnRefs[i])));
+        fns.push(new PDFFunction(xref, xref.fetchIfRef(fnRefs[i])));
 
       var bounds = dict.get('Bounds');
       var encode = dict.get('Encode');
 
-      return [CONSTRUCT_STICHED, domain, bounds, encode, fns];
-    },
-
-    constructStichedFromIR: function pdfFunctionConstructStichedFromIR(IR) {
-      var domain = IR[1];
-      var bounds = IR[2];
-      var encode = IR[3];
-      var fnsIR = IR[4];
-      var fns = [];
-
-      for (var i = 0; i < fnsIR.length; i++) {
-        fns.push(PDFFunction.unserialize(fnsIR[i]));
-      }
-
-      return function(args) {
-        var clip = function(v, min, max) {
+      this.func = function pdfFunctionConstructStichedFunc(args) {
+        var clip = function pdfFunctionConstructStichedFuncClip(v, min, max) {
           if (v > max)
             v = max;
           else if (v < min)
@@ -6441,20 +6818,16 @@ var PDFFunction = (function() {
         var v2 = rmin + (v - dmin) * (rmax - rmin) / (dmax - dmin);
 
         // call the appropropriate function
-        return fns[i]([v2]);
+        return fns[i].func([v2]);
       };
     },
-
     constructPostScript: function pdfFunctionConstructPostScript() {
-      return [CONSTRUCT_POSTSCRIPT];
-    },
-
-    constructPostScriptFromIR: function pdfFunctionConstructPostScriptFromIR() {
       TODO('unhandled type of function');
-      return function() {
+      this.func = function pdfFunctionConstructPostScriptFunc() {
         return [255, 105, 180];
       };
     }
   };
-})();
 
+  return constructor;
+})();
