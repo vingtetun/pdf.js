@@ -5794,11 +5794,6 @@ var Pattern = (function patternPattern() {
     }
   };
 
-  constructor.shadingFromIR = function pattern_shadingFromIR(ctx, raw) {
-    var obj = window[raw[0]];
-    return obj.fromIR(ctx, raw);
-  }
-
   constructor.parseShading = function pattern_shading(shading, matrix,
       xref, res, ctx) {
 
